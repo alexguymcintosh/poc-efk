@@ -1,0 +1,7 @@
+pico_firmware/build/
+pico_firmware/cmake-build-*/
+ros2_ws/__pycache__/
+*.pyc
+*.bag
+*.db3
+*.mcap
