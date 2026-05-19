@@ -1,229 +1,256 @@
-# Terminal Command Reference — EKF Localisation Session
+# EKF Test Commands
 
-Commands in the order you run them. Every session follows this sequence.
+One step at a time. Each numbered block is ONE command with ONE purpose. Run in order. If a step fails, stop and debug — don't skip ahead.
 
----
-
-## Stage 1 — Check Hardware State
-
-### Check what the Pico looks like to the laptop
-```bash
-lsusb | grep -i 2e8a
-```
-**What it is:** `lsusb` lists all USB devices. We filter for Raspberry Pi's vendor ID `2e8a`.
-**What you're looking for:**
-- `2e8a:000f` = Pico in **boot mode** (BOOTSEL was held — ready to receive new firmware)
-- `2e8a:0009` = Pico in **running mode** (firmware loaded, streaming data)
-- Nothing = not plugged in or not recognised
-
-**When to use:** First thing every session. Also after flashing to confirm it switched from `000f` → `0009`.
+All steps run on the laptop host. No docker.
 
 ---
 
-## Stage 2 — Build New Firmware
-
-Run these once per session when firmware has changed.
-
-### Delete the stale build directory
+## 1. Is the Pico connected?
 ```bash
-rm -rf /workspace/alex/agent/rob/rover/p1/loc/ekf/pico_firmware/build
+lsusb | grep -i "2e8a\|raspberry\|pico"
 ```
-**What it is:** `rm -rf` removes a directory and everything inside it. Required because CMake bakes absolute paths into its cache — if the build dir exists from a different machine or path, cmake fails silently.
-**When to use:** Before every cmake run. Safe to run even if build/ doesn't exist.
+- `2e8a:0009` → running normally → go to step 2
+- `2e8a:000f` → bootloader mode → go to step 1b
+- nothing → check USB cable, replug
 
-### Configure the build
+## 1b. Flash firmware (only if step 1 showed bootloader)
 ```bash
-cd /workspace/alex/agent/rob/rover/p1/loc/ekf/pico_firmware && mkdir build && cd build
-cmake -DPICO_BOARD=pico2 -DCMAKE_TOOLCHAIN_FILE=$PICO_SDK_PATH/cmake/preload/toolchains/pico_arm_cortex_m33_gcc.cmake ..
+cp ~/system/alex/agent/rob/rover/p1/loc/ekf/pico_firmware/build/imu.uf2 /media/$USER/RP2350/
 ```
-**What it is:** `cmake` reads `CMakeLists.txt` and generates the actual Makefile. The flags tell it: target is Pico 2 (RP2350), use the ARM cross-compiler (compiles code for the Pico's CPU, not your laptop's CPU). The `..` means "CMakeLists.txt is one directory up."
-**When to use:** Once after deleting build/.
+Pico reboots automatically. Go back to step 1.
 
-### Compile the firmware
+## 2. Does the serial port exist?
 ```bash
-make -j
+ls /dev/ttyACM*
 ```
-**What it is:** Runs the compiler. `-j` uses all CPU cores in parallel — faster. Produces `imu.uf2` in the build directory.
-**When to use:** After cmake. Takes ~30 seconds.
+- `/dev/ttyACM0` → proceed
+- `No such file` → Pico isn't running firmware, go back to step 1
 
----
-
-## Stage 3 — Flash Firmware to Pico
-
-### Put Pico in boot mode
-1. Hold the **BOOTSEL** button on the Pico
-2. Unplug the USB cable
-3. Plug the USB cable back in
-4. Release BOOTSEL
-
-The Pico mounts as a USB drive called `RP2350`. Run `lsusb | grep 2e8a` — should show `000f`.
-
-### Copy the firmware file to the Pico
-```bash
-cp /workspace/alex/agent/rob/rover/p1/loc/ekf/pico_firmware/build/imu.uf2 /media/$USER/RP2350/
-```
-**What it is:** Copies the compiled firmware file to the Pico's USB drive. The Pico automatically reboots into the new firmware and unmounts the drive.
-**`$USER`** is automatically replaced with your Linux username (e.g. `knucky-rover-team`).
-**When to use:** After `make -j` succeeds and Pico is in boot mode.
-
-### Confirm Pico is running the new firmware
-```bash
-lsusb | grep -i 2e8a
-```
-Should now show `0009` (running). The drive disappears — that's normal.
-
----
-
-## Stage 4 — Verify Raw Serial Output
-
-### Read raw lines from the Pico
+## 3. Verify raw serial data
 ```bash
 head -20 < /dev/ttyACM0
 ```
-**What it is:** Opens the USB serial port and prints the first 20 lines. The Pico streams CSV lines here before any ROS software is involved.
-**What you're looking for:**
+Expect lines starting with `IMU:`, `MAG:`, `GPS:`. If it stalls, Ctrl-C and retry.
+
+## 4. Check for already-running ROS2 nodes
+```bash
+ros2 node list
 ```
-IMU: MPU-6050 awake.
-IMU: calibrating gyro...
-IMU: gyro bias gx=+0.0012 ...
-MAG: HMC5883L found at 0x1E     ← or QMC5883L at 0x0D
-GPS: locked baud 57600
-IMU:0.1234,0.0012,...
-MAG:245.3,88.1,-412.7
-GPS:$GNGGA,...
+- empty output → go to step 5
+- any nodes listed → go to step 4b first
+
+## 4b. Kill stale nodes (only if step 4 listed any)
+```bash
+pkill -f serial_parser_node; pkill -f imu_node; pkill -f mag_node; pkill -f gps_node; pkill -f ekf_node; pkill -f gps_to_odom_node; pkill -f static_transform_publisher; pkill -f foxglove_bridge; sleep 0.5
 ```
-**When to use:** Immediately after firmware flashes and Pico switches to `0009`. This is your first sanity check — before launching any ROS nodes.
+Then re-run step 4 to confirm it's empty.
+
+## 5. Launch the pipeline — Terminal 1 (stays open)
+```bash
+cd ~/ros2_ws && source /opt/ros/jazzy/setup.bash && source install/setup.bash && ros2 launch pico_bridge pico_bridge.launch.py
+```
+Expect log lines from `serial_parser`, `imu_node`, `mag_node`, `gps_node`, `gps_to_odom_node`, `ekf_filter_node`. Leave this terminal running. **Open a new terminal for the next steps.**
 
 ---
 
-## Stage 5 — Build the ROS2 Package
-
-Run this when Python nodes have changed (not every session — only after code edits).
-
-### Build the pico_bridge package
+## 6. Source ROS2 in the new terminal (once per new terminal)
 ```bash
-cd ~/ros2_ws && colcon build --packages-select pico_bridge
+source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash
 ```
-**What it is:** `colcon` is ROS2's build tool. It compiles/installs the Python nodes in `ros2_ws/`. `--packages-select pico_bridge` only rebuilds our package, not everything.
-**When to use:** After editing any `.py` file in `ros2_ws/pico_bridge/` or after changing `ekf.yaml`.
 
-### Load the new build into your shell
+## 7. Confirm all nodes are running
 ```bash
-source ~/ros2_ws/install/setup.bash
+ros2 node list
 ```
-**What it is:** Adds the freshly built package to your PATH so ROS2 can find it. Must run in any new terminal before using `ros2` commands.
-**When to use:** After every `colcon build`, and at the start of every new terminal window.
+Expect: `/serial_parser`, `/imu_node`, `/mag_node`, `/gps_node`, `/gps_to_odom`, `/ekf_filter_node`, `/tf_base_to_imu`, `/tf_base_to_gps`.
+
+## 8. Check raw IMU stream
+```bash
+ros2 topic echo /pico/imu_raw --once
+```
+Expect a `std_msgs/String` line with comma-separated floats.
+
+## 9. Check raw MAG stream
+```bash
+ros2 topic echo /pico/mag_raw --once
+```
+Expect a `std_msgs/String` starting `MAG:` with three floats.
+
+## 10. Check parsed IMU
+```bash
+ros2 topic echo /imu/data_raw --once
+```
+Expect a `sensor_msgs/Imu` with non-zero `angular_velocity` and `linear_acceleration`.
+
+## 11. Check magnetometer-derived heading
+```bash
+ros2 topic echo /imu/data --once
+```
+Expect a `sensor_msgs/Imu` with non-zero `orientation.z` / `orientation.w` (yaw quaternion).
+
+## 12. Check GPS fix (needs outdoor sky view)
+```bash
+ros2 topic echo /fix --once
+```
+Expect a `sensor_msgs/NavSatFix` with valid lat/lon. No fix → take the rig outside and wait ~30s.
+
+## 13. Check GPS odometry
+```bash
+ros2 topic echo /odometry/gps --once
+```
+Expect a `nav_msgs/Odometry`. `position.x/y` should be near 0 at the datum (first GPS fix).
+
+## 14. Check fused EKF output
+```bash
+ros2 topic echo /odometry/filtered --once
+```
+Expect a `nav_msgs/Odometry` — fused pose and orientation.
 
 ---
 
-## Stage 6 — Launch the Full Pipeline
-
-### Kill any leftover nodes from a previous session
+## 15. IMU rate
 ```bash
-pkill -f serial_parser_node; pkill -f imu_node; pkill -f gps_node
-pkill -f ekf_node; pkill -f gps_to_odom_node; pkill -f static_transform_publisher
-pkill screen; pkill -f foxglove_bridge
+ros2 topic hz /imu/data_raw
 ```
-**What it is:** `pkill -f` kills any process whose command line matches that string. Cleans up stale nodes so the new launch doesn't fight with old ones.
-**When to use:** Start of every session before launching.
+Expect ~100Hz. Ctrl-C to stop.
 
-### Launch the sensor pipeline
+## 16. Mag-heading rate
 ```bash
-cd ~/ros2_ws && source install/setup.bash && ros2 launch pico_bridge pico_bridge.launch.py
+ros2 topic hz /imu/data
 ```
-**What it is:** Starts all nodes at once — serial_parser, imu_node, gps_node, mag_node, gps_to_odom_node, ekf_filter_node. Leave this terminal open and watch for errors.
-**When to use:** After hardware is confirmed working (Stage 4).
+Expect ~50Hz. Ctrl-C to stop.
+
+## 17. EKF output rate
+```bash
+ros2 topic hz /odometry/filtered
+```
+Expect ~30Hz. Ctrl-C to stop.
 
 ---
 
-## Stage 7 — Verify Each Topic is Alive
-
-Run these in a **second terminal** while the pipeline is running.
-
-### Check a single message on each topic (in this order)
-```bash
-source ~/ros2_ws/install/setup.bash
-
-ros2 topic echo /pico/imu_raw --once       # raw IMU CSV from serial parser
-ros2 topic echo /pico/mag_raw --once       # raw MAG CSV from serial parser
-ros2 topic echo /imu/data_raw --once       # processed IMU (Imu message)
-ros2 topic echo /imu/data --once           # IMU with orientation from mag
-ros2 topic echo /fix --once                # GPS fix (needs outdoor signal)
-ros2 topic echo /odometry/gps --once       # GPS converted to local x/y
-ros2 topic echo /odometry/filtered --once  # EKF fused output
-```
-**What it is:** `ros2 topic echo` prints one message from a topic and exits. `--once` stops after one message instead of streaming forever.
-**What you're looking for:** Data at each stage. If a topic is silent, the node feeding it has a problem.
-
-### Check topic rates
-```bash
-ros2 topic hz /imu/data_raw        # expect ~100Hz
-ros2 topic hz /imu/data            # expect ~100Hz
-ros2 topic hz /fix                 # expect ~1Hz (GPS)
-ros2 topic hz /odometry/filtered   # expect ~30Hz (EKF)
-```
-**What it is:** Prints how many messages per second are arriving. A rate of 0 means the node is not publishing.
-
----
-
-## Stage 8 — Visualise
-
-### Draw the live node/topic graph
+## 18. (Optional) Visualise topology
 ```bash
 ros2 run rqt_graph rqt_graph
 ```
-**What it is:** Opens a GUI window showing every running ROS node as a box and every topic as an arrow between boxes. This is your "did everything connect correctly" picture. Refresh it by clicking the circular arrow button in the window.
-**When to use:** After launching the pipeline to confirm the graph matches the architecture diagram.
 
-### Start the Foxglove bridge
+## 19. Foxglove bridge — Terminal 3 (stays open)
 ```bash
-ros2 launch foxglove_bridge foxglove_bridge_launch.xml
+source /opt/ros/jazzy/setup.bash && ros2 launch foxglove_bridge foxglove_bridge_launch.xml
 ```
-**What it is:** Starts a WebSocket server on port 8765. Foxglove Studio (the desktop app) connects to it and shows live sensor data as plots, maps, and 3D views.
-**When to use:** After verifying topics are alive. Open Foxglove Studio → Connect → `ws://localhost:8765`.
+Connect Foxglove Studio to `ws://localhost:8765`.
 
-**Foxglove panels to add:**
-- Map → `/fix` — GPS dot on satellite map
-- Plot → `/odometry/filtered` position x and y — EKF path
-- Plot → `/imu/data_raw` angular_velocity.z — yaw rate
-- Raw Messages → `/imu/data` — check orientation quaternion
+Panels to add in Foxglove:
+- Map → `/fix`
+- Plot → `/odometry/filtered` pose.x and pose.y
+- Plot → `/imu/data_raw` angular_velocity.z
+- Raw Messages → `/imu/data` (orientation quaternion)
 
 ---
 
-## Stage 9 — Record and Analyse Data
-
-### Record a bag (run for 60s stationary, then 40m walk)
+## 20. Make bags directory (only first time)
 ```bash
 mkdir -p ~/ros2_ws/bags
-ros2 bag record /fix /imu/data_raw /imu/data /odometry/filtered /odometry/gps \
-  -o ~/ros2_ws/bags/test_mag_01
 ```
-**What it is:** Records all messages on those topics to a file. `Ctrl+C` to stop recording.
-**When to use:** Once pipeline is confirmed working — stationary test first, then walk test.
-
-### Analyse the bag
-```bash
-source /opt/ros/jazzy/setup.bash
-python3 /workspace/alex/agent/rob/rover/p1/loc/ekf/analyse_bag.py ~/ros2_ws/bags/test_mag_01
-```
-**What it is:** Reads the bag file and produces path plots as PNG images — GPS path vs EKF path. The goal is both lines overlapping closely.
 
 ---
 
-## Quick Reference — Pico States
+# === TEST PROTOCOL ===
 
-| `lsusb` output | State | Action needed |
-|---|---|---|
-| `2e8a:000f` | Boot mode | Ready to flash `.uf2` |
-| `2e8a:0009` | Running | Firmware active, serial live |
-| Nothing | Not connected | Check USB cable |
+Goal: never start a walk bag without proof the pipeline is actually publishing. Steps 21–25 run live rate checks. Step 26 is a short stationary smoke-test bag — claude verifies all topics captured non-zero messages BEFORE you walk. The walk only starts at step 28.
 
-## Quick Reference — Common Failures
+Sequence: 21 → 22 → 23 → 24 → 25 (paste all five outputs to claude) → 26 → 27 (paste to claude) → 28 → 29 → 30.
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `/dev/ttyACM0` not found | Pico not in running mode | Check `lsusb` |
-| `MAG:` lines missing | Mag not wired or wrong address | Check wiring, check boot output |
-| `/imu/data` orientation all zeros | mag_node not publishing | Check mag_node logs |
-| EKF not publishing | Topic rate 0 on `/odometry/gps` | GPS needs outdoor fix |
-| cmake fails | Stale build dir | Delete `pico_firmware/build/` and rerun |
+---
+
+## Pre-bag health checks (paste each output to claude)
+
+Each command: let it run ~10 seconds, Ctrl-C, move to the next.
+
+## 21. IMU raw rate (expect ~100 Hz)
+```bash
+ros2 topic hz /imu/data_raw
+```
+
+## 22. IMU + mag heading rate (expect ~50 Hz)
+```bash
+ros2 topic hz /imu/data
+```
+
+## 23. GPS rate (expect ~1 Hz — use window of 5 so average appears in ~5s)
+```bash
+ros2 topic hz /fix -w 5
+```
+
+## 24. EKF output rate (expect ~30 Hz)
+```bash
+ros2 topic hz /odometry/filtered
+```
+
+## 25. Confirm GPS has a real fix
+```bash
+ros2 topic echo /fix --once
+```
+Look for `status.status: 0` (or higher) and non-zero `latitude`/`longitude`. If `status: -1` → no fix yet, wait outdoors.
+
+**Paste 21–25 outputs to claude. Claude confirms green-light before step 26.**
+
+---
+
+## Stationary smoke test (verify the bag actually captures)
+
+## 26. Record a 30-second stationary bag
+```bash
+ros2 bag record /fix /imu/data_raw /imu/data /odometry/filtered /odometry/gps -o ~/ros2_ws/bags/stationary_01
+```
+Hold the rig still. Ctrl-C after ~30 seconds. Increment the number (`stationary_02`, …) for repeats.
+
+## 27. Show smoke-test bag message counts
+```bash
+ros2 bag info ~/ros2_ws/bags/stationary_01
+```
+**Paste output to claude.** Every topic must show a non-zero count proportional to its rate (~3000 IMU raw, ~1500 IMU data, ~30 fix, ~900 filtered, ~30 odom gps for 30s).
+
+If any topic = 0 → pipeline broken upstream. DO NOT walk. Debug first (`head -20 < /dev/ttyACM0`, `ros2 node list`, restart pipeline).
+
+---
+
+## Walk test
+
+## 28. Record the walk
+```bash
+ros2 bag record /fix /imu/data_raw /imu/data /odometry/filtered /odometry/gps -o ~/ros2_ws/bags/walk_01
+```
+Walk the planned route. Ctrl-C to stop. Increment the number for repeats.
+
+## 29. Verify walk bag captured
+```bash
+ros2 bag info ~/ros2_ws/bags/walk_01
+```
+Paste to claude. Same non-zero-counts rule as step 27.
+
+## 30. Analyse the walk
+```bash
+python3 ~/system/alex/agent/rob/rover/p1/loc/ekf/analyse_bag.py ~/ros2_ws/bags/walk_01
+```
+Produces `combined_paths.png`, `ekf_xy_time.png`, `imu_gyro_z_time.png` in your current directory. Paste the summary stats to claude.
+
+---
+
+## When to rebuild
+
+`~/ros2_ws/src/pico_bridge` is a symlink to the project repo, built with `--symlink-install`. Python edits in `ekf/ros2_ws/pico_bridge/*.py` are picked up automatically — no rebuild needed.
+
+**Rebuild only if you change:** `setup.py` (entry points), `package.xml`, `launch/*.py`, or `config/*.yaml`.
+
+### Rebuild ROS2 package
+```bash
+cd ~/ros2_ws && colcon build --symlink-install --packages-select pico_bridge
+```
+Then `source ~/ros2_ws/install/setup.bash` in any open terminals.
+
+### Rebuild Pico firmware (only if `pico_firmware/*.cpp` changed)
+```bash
+cd ~/system/alex/agent/rob/rover/p1/loc/ekf/pico_firmware/build && make -j
+```
+Then put the Pico in bootloader mode (hold BOOTSEL while replugging USB) and flash per step 1b.

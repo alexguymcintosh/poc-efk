@@ -22,7 +22,7 @@ The long-term goal: a swarm of autonomous rovers navigating broadacre paddocks u
 | Microcontroller | Raspberry Pi Pico 2 (RP2350) | Bare metal sensor bridge |
 | IMU | GY-521 (MPU-6050) | 6-axis accel + gyro over I2C |
 | GPS | GY-GPSV3 (NEO-M9N) | Multi-GNSS, 1Hz NMEA over UART |
-| Magnetometer | HMC5883L / QMC5883L | Absolute heading — **next hardware addition** |
+| Magnetometer | HMC5883L (or QMC5883L variant) | Absolute heading — wired and fused into EKF |
 | Laptop | Pop!_OS 24.04, ThinkPad | ROS2 Jazzy, EKF, visualisation |
 
 **Why the Pico 2 as a dumb bridge and not a Pi Zero 2W:**
@@ -50,23 +50,30 @@ MicroPython has a Global Interpreter Lock and non-deterministic timing. C++ with
 
 ```
 poc-ekf/
+├── README.md                       # this file
+├── COMMANDS.md                     # step-by-step test protocol (the runbook for every session)
+├── HARDWARE.md                     # wiring and component notes
+├── STATUS.md / DIRECTION.md        # current state + master-agent direction (auto-maintained)
 ├── pico_firmware/
-│   ├── main.cpp              # Pico firmware — IMU + GPS bridge
-│   ├── CMakeLists.txt        # Pico SDK build config
+│   ├── main.cpp                    # Pico firmware — IMU + MAG + GPS bridge
+│   ├── CMakeLists.txt              # Pico SDK build config
 │   └── pico_sdk_import.cmake
-├── ros2_ws/                  # ROS2 pico_bridge package
+├── ros2_ws/                        # ROS2 pico_bridge package (symlinked into ~/ros2_ws/src/)
 │   ├── pico_bridge/
 │   │   ├── serial_parser_node.py   # Opens /dev/ttyACM0, routes by prefix
-│   │   ├── imu_node.py             # Publishes /imu/data_raw
+│   │   ├── imu_node.py             # Publishes /imu/data_raw (gyro + accel)
+│   │   ├── mag_node.py             # Publishes /imu/data (orientation quaternion from mag yaw)
 │   │   ├── gps_node.py             # Publishes /fix
 │   │   └── gps_to_odom_node.py     # Converts /fix → /odometry/gps
 │   ├── config/
-│   │   └── ekf.yaml          # robot_localization EKF parameters
+│   │   └── ekf.yaml                # robot_localization EKF parameters
 │   ├── launch/
 │   │   └── pico_bridge.launch.py   # Launches full pipeline
 │   ├── setup.py
 │   └── package.xml
-└── analyse_bag.py            # ROS bag analysis and path visualisation
+├── analyse_bag.py                  # ROS bag analysis and path visualisation
+└── test_results/                   # Bagged sessions + analysis PNGs, dated subdirs
+    └── 2026-05-20_outdoor_walk_01/ # First outdoor walk with mag fusion
 ```
 
 ---
@@ -74,36 +81,39 @@ poc-ekf/
 ## System Architecture
 
 ```
-MPU-6050 (I2C0, GP4/GP5, 100Hz)  ──┐
-                                     │
-NEO-M9N  (UART0, GP0/GP1, 1Hz)   ──┤
-                                     │
-         Raspberry Pi Pico 2         │
-         - Gyro bias calibration     │
-         - Baud auto-detection       │
-         - CSV framing               │
-         - USB CDC stream           ─┘
+MPU-6050  (I2C0 0x68, GP4/GP5,  100Hz)  ──┐
+HMC5883L  (I2C0 0x1E, GP4/GP5,   50Hz)  ──┤
+NEO-M9N   (UART0,     GP0/GP1,    1Hz)  ──┤
+                                            │
+         Raspberry Pi Pico 2                │
+         - Gyro bias calibration            │
+         - Mag hard-iron bias calibration   │
+         - GPS UART baud auto-detection     │
+         - CSV framing per sensor           │
+         - USB CDC stream                  ─┘
                   │
          /dev/ttyACM0 (115200 baud)
                   │
          serial_parser_node
          - Prefix routing
          - IMU: → /pico/imu_raw
+         - MAG: → /pico/mag_raw
          - GPS: → /pico/gps_raw
-              │              │
-         imu_node        gps_node
-              │              │
-     /imu/data_raw        /fix
-              │              │
-              │      gps_to_odom_node
-              │              │
-              │      /odometry/gps
-              │              │
-              └──────────────┘
-                      │
-                 ekf_filter_node
-                      │
-            /odometry/filtered ← fused pose at 30Hz
+              │           │           │
+         imu_node    mag_node    gps_node
+              │           │           │
+     /imu/data_raw   /imu/data      /fix
+       (100Hz)       (50Hz, mag      │
+              │       yaw quat)      │
+              │           │   gps_to_odom_node
+              │           │           │
+              │           │     /odometry/gps
+              │           │           │
+              └───────────┴───────────┘
+                          │
+                    ekf_filter_node
+                          │
+              /odometry/filtered ← fused pose at 30Hz
 ```
 
 ---
@@ -124,47 +134,60 @@ robot_localization includes navsat_transform_node for converting GPS to odometry
 
 Solution: a 30-line custom node that converts lat/lon to local x/y metres using equirectangular projection relative to the first valid GPS fix as datum. No external heading required. No deadlock. Works perfectly.
 
-### 5. Linear acceleration NOT fused into EKF (currently)
-Fusing ax/ay/az from an IMU without a magnetometer is a critical mistake. Without absolute heading, the EKF double-integrates noisy acceleration in an unknown frame. The walk test showed the EKF reporting 685m travelled when the actual distance was ~40-50m — entirely caused by this. Currently only angular velocity (gyro) is fused. GPS handles all position. The linear acceleration will be re-enabled once the magnetometer provides absolute heading.
+### 5. Linear acceleration NOT fused into EKF (still)
+Even with the mag now providing absolute yaw, linear acceleration is deliberately left disabled in `ekf.yaml` (`imu0_config` last three values all `false`). Reason: until the mag heading is shown to be stable end-to-end, fusing ax/ay/az on top of a noisy heading just integrates that noise into position. The first outdoor walk (see [`test_results/2026-05-20_outdoor_walk_01/`](test_results/2026-05-20_outdoor_walk_01/README.md)) confirmed the mag heading is **not** stable enough yet — the EKF sawtooths between GPS updates and over-counts distance 2.4×. Re-enable accel fusion only after mag calibration is improved.
+
+### 6. Magnetometer wired on the same I2C bus as the IMU
+HMC5883L lives at I2C0 0x1E; MPU-6050 at I2C0 0x68. No address conflict, no extra bus. The Pico probes both chips at boot and falls back gracefully if either is missing. Boot-time hard-iron calibration takes 100 stationary samples and subtracts the mean — adequate for a first walk but **insufficient long-term** (no soft-iron correction, no orientation coverage). The first outdoor test made this limitation visible: post-calibration mag values jump frame-to-frame by similar magnitude to the signal itself.
 
 ---
 
 ## What the Data Shows
 
-### Stationary test (60 seconds, sensor not moving):
-- EKF drift: ~3m start-to-end — GPS noise floor, expected
-- GPS raw drift: ~1.3m in first 10 seconds — ~5m accuracy without DGPS
+### First outdoor walk — 2026-05-20 ([full results here](test_results/2026-05-20_outdoor_walk_01/README.md))
 
-### Walk test (out and back, ~40-50m actual):
-- GPS raw path: correct, tracks the actual walk closely
-- EKF path: 685m reported — caused by linear acceleration fusion without heading reference
-- After disabling linear acceleration fusion: EKF will track GPS closely
+70.8 second out-and-back walk, ~74 m actual distance, hand-held rig.
 
-The path plot (combined_paths.png from analyse_bag.py) shows this clearly. GPS and GPS-odom overlay almost perfectly. EKF diverges because of heading drift.
+| Metric | EKF | GPS-raw | Comment |
+|---|---|---|---|
+| Total distance travelled | 175.12 m | 73.93 m | EKF over-counts 2.4× |
+| Start → end displacement | 5.66 m | 5.44 m | Within 0.2 m — endpoint excellent |
+
+**Working:** macro trajectory matches GPS, endpoint within 0.2 m, full pipeline alive 70+ s with no dropouts, all topic rates correct (IMU 100 Hz, mag 50 Hz, EKF 30 Hz, GPS 1 Hz).
+
+**Broken:** EKF path is a sawtooth ~2 m peak-to-peak overlaid on the true path — visible in `combined_paths.png`. Root cause: no velocity source, plus noisy mag heading rotating the velocity vector between 1 Hz GPS corrections.
+
+### Stationary smoke-test (31 s)
+All five topics captured at expected counts. Mandatory pre-walk check after `test_mag_02` recorded `/odometry/filtered` only — the rest had silently died because the Pico's GPS UART had stopped emitting. See [`COMMANDS.md`](COMMANDS.md) steps 26–27 for the protocol.
 
 ---
 
 ## Current Limitations
 
-| Limitation | Impact | Fix |
+| Limitation | Impact | Status / Fix |
 |---|---|---|
-| No magnetometer | No absolute heading — EKF position drifts | **Adding HMC5883L next session** |
-| GPS 1Hz | Slow position corrections | Configure NEO-M9N to 10Hz via UBX-CFG-RATE |
+| Mag hard-iron-only calibration | Heading noisy (~±a few degrees), EKF sawtooths between GPS samples | Need figure-8 / sphere-fit calibration |
+| No velocity source in EKF | Position propagation between GPS updates is unconstrained | Either re-enable accel fusion (after mag is stable) or add wheel odometry once we have a chassis |
+| GPS 1 Hz | Slow position corrections | Configure NEO-M9N to 10 Hz via UBX-CFG-RATE |
 | MPU-6050 gyro bias | Startup calibration only — drifts with temperature | Online bias estimation in EKF |
-| ~5m GPS accuracy | Position noise floor | RTK GPS for centimetre accuracy |
+| ~5 m GPS accuracy | Position noise floor | RTK GPS for centimetre accuracy (deferred — Pixhawk 6C path may use this) |
 
 ---
 
 ## What's Next
 
-### Immediate — Magnetometer (next session)
-Wire HMC5883L to I2C0 bus alongside the MPU-6050 (address 0x1E — no conflict). Add to firmware read sequence. Publish orientation quaternion in imu_node. Re-enable ax/ay/az in EKF imu0_config. Rerun walk test — the 685m triangle should become a tight path matching GPS.
+### Immediate — Pixhawk 6C as accuracy baseline
+The first outdoor walk showed the raw stack (MPU-6050 + HMC5883L + NEO-M9N + robot_localization) gets the macro trajectory right but adds ~100 m of fake path through heading-noise integration. Rather than tune-and-retest the raw stack blind, bring up a Pixhawk 6C in parallel:
 
-### Short term — System debugging and tuning
-- Foxglove dashboard for real-time monitoring of all sensor streams
-- EKF covariance tuning — adjust Q and R matrices based on bag analysis
-- GPS update rate — configure to 10Hz via UBX protocol
-- IMU online bias estimation
+- 6C has aerospace-grade IMUs (ICM-42688-P + BMI088, redundant), a better magnetometer (IST8310 with proper soft-iron calibration in PX4/ArduPilot), and onboard EKF2/EKF3 doing the fusion correctly.
+- Surface its fused odometry to ROS2 via `mavros` (or `micro-XRCE-DDS` for PX4 v1.14+).
+- Use the 6C output as the reference to validate raw-hardware tuning against — same walk, both rigs co-mounted, compare paths.
+
+### After 6C baseline — tune the raw stack
+1. Figure-8 magnetometer calibration in firmware (sphere fit captures hard + soft iron). Biggest single lever.
+2. Bump mag orientation covariance in `mag_node.py` (currently `0.1`, try `~1.0`) so the EKF trusts the mag less.
+3. Re-enable linear acceleration fusion in `ekf.yaml` once mag heading is stable.
+4. GPS update rate to 10 Hz via UBX-CFG-RATE.
 
 ### Medium term — Nav2 waypoint guidance
 - Input GPS waypoints
@@ -220,75 +243,32 @@ cp build/imu.uf2 /media/$USER/RP2350/
 ```
 
 ### Build ROS2 Package
+The repo's `ros2_ws/pico_bridge` directory is the actual package — symlink it into a colcon workspace and build with `--symlink-install` so Python edits in this repo are picked up without rebuilding:
 ```bash
 mkdir -p ~/ros2_ws/src
-cp -r ros2_ws ~/ros2_ws/src/pico_bridge
+ln -s ~/system/alex/agent/rob/rover/p1/loc/ekf/ros2_ws ~/ros2_ws/src/pico_bridge
 cd ~/ros2_ws
-colcon build --packages-select pico_bridge
+colcon build --symlink-install --packages-select pico_bridge
 source install/setup.bash
 echo 'source ~/ros2_ws/install/setup.bash' >> ~/.bashrc
 ```
+A rebuild is only required when `setup.py`, `package.xml`, `launch/*.py`, or `config/*.yaml` changes — not for `*.py` edits inside `pico_bridge/`.
 
 ---
 
-## Every Session Startup
+## Running a Test Session
 
-```bash
-# Kill any stale nodes
-pkill -f serial_parser_node; pkill -f imu_node; pkill -f gps_node
-pkill -f ekf_node; pkill -f gps_to_odom_node; pkill -f static_transform_publisher
-pkill screen; pkill -f foxglove_bridge
+**Always follow [`COMMANDS.md`](COMMANDS.md)** — it's the canonical step-by-step runbook. Every command is single-purpose; the file is updated each session as the protocol evolves.
 
-# Verify Pico is running (should show 0009 not 000f)
-lsusb | grep -i 2e8a
+Summary of phases:
+1. **Steps 1–4** — pre-flight: confirm Pico is running, /dev/ttyACM0 exists, raw serial flowing, no stale nodes
+2. **Step 5** — launch the full pipeline in Terminal 1 and leave it open
+3. **Steps 6–19** — sanity-check each topic, rates, and Foxglove visualisation
+4. **Steps 20–25** — pre-bag health checks (paste outputs to claude for green-light)
+5. **Steps 26–27** — mandatory stationary smoke-test bag, verify all topics captured
+6. **Steps 28–30** — walk recording + analysis
 
-# Launch pipeline
-cd ~/ros2_ws && source install/setup.bash
-ros2 launch pico_bridge pico_bridge.launch.py
-
-# Optional — Foxglove visualisation
-ros2 launch foxglove_bridge foxglove_bridge_launch.xml
-# Connect Foxglove Studio to ws://localhost:8765
-```
-
----
-
-## Verify Pipeline Layer by Layer
-
-```bash
-# Raw serial data
-head -5 < /dev/ttyACM0
-
-# Each topic in order
-ros2 topic echo /pico/imu_raw --once
-ros2 topic echo /pico/gps_raw --once
-ros2 topic echo /imu/data_raw --once
-ros2 topic echo /fix --once          # needs outdoor GPS fix
-ros2 topic echo /odometry/gps --once
-ros2 topic echo /odometry/filtered --once
-
-# Topic rates
-ros2 topic hz /imu/data_raw   # expect ~100Hz
-ros2 topic hz /fix             # expect ~1Hz
-ros2 topic hz /odometry/filtered  # expect ~30Hz
-```
-
----
-
-## Record and Analyse Data
-
-```bash
-# Record
-mkdir -p ~/ros2_ws/bags
-ros2 bag record /fix /imu/data_raw /odometry/filtered /odometry/gps \
-  -o ~/ros2_ws/bags/test_name
-
-# Analyse
-source /opt/ros/jazzy/setup.bash
-python3 analyse_bag.py ~/ros2_ws/bags/test_name
-```
-
-Produces: `combined_paths.png`, `ekf_xy_time.png`, `imu_gyro_z_time.png`
+See [`test_results/`](test_results/) for archived bagged sessions and the analysis PNGs they produced.
 
 ---
 

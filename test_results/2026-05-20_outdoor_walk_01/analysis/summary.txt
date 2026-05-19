@@ -1,0 +1,17 @@
+Reading bag: ~/ros2_ws/bags/walk_01
+  /fix: 71 messages
+  /odometry/filtered: 2125 messages
+  /odometry/gps: 71 messages
+  /imu/data_raw: 7084 messages
+
+Wrote combined_paths.png
+Wrote ekf_xy_time.png
+Wrote imu_gyro_z_time.png
+
+=== Summary stats ===
+EKF total distance travelled :   175.12 m
+EKF max drift in first 10s    :     3.23 m   (assumed stationary — actually walking)
+EKF start->end displacement  :     5.66 m
+GPS-raw total path length    :    73.93 m
+GPS-raw max drift in first 10s:     3.89 m   (assumed stationary — actually walking)
+GPS-raw start->end displacement:     5.44 m

@@ -5,3 +5,9 @@ ros2_ws/__pycache__/
 *.bag
 *.db3
 *.mcap
+
+# Archived test runs are committed (small, dated, reproducible).
+# Loose bags in ~/ros2_ws/bags/ still won't be tracked.
+!test_results/**/*.mcap
+!test_results/**/*.bag
+!test_results/**/*.db3
