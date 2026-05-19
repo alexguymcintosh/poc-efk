@@ -25,6 +25,7 @@ def generate_launch_description():
         cmd=['bash', '-c',
              "pkill -f 'lib/pico_bridge/serial_parser_node' ; "
              "pkill -f 'lib/pico_bridge/imu_node' ; "
+             "pkill -f 'lib/pico_bridge/mag_node' ; "
              "pkill -f 'lib/pico_bridge/gps_node' ; "
              "pkill -f 'lib/pico_bridge/gps_to_odom_node' ; "
              "pkill -f 'lib/robot_localization/ekf_node' ; "
@@ -50,6 +51,14 @@ def generate_launch_description():
         executable='imu_node',
         name='imu_node',
         output='screen',
+    )
+
+    mag_node = Node(
+        package='pico_bridge',
+        executable='mag_node',
+        name='mag_node',
+        output='screen',
+        parameters=[{'declination': 0.0}],
     )
 
     gps_node = Node(
@@ -101,6 +110,7 @@ def generate_launch_description():
             on_exit=[
                 serial_parser,
                 imu_node,
+                mag_node,
                 gps_node,
                 tf_base_to_imu,
                 tf_base_to_gps,

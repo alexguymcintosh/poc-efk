@@ -17,6 +17,7 @@ class SerialParserNode(Node):
 
         self.imu_pub = self.create_publisher(String, '/pico/imu_raw', 50)
         self.gps_pub = self.create_publisher(String, '/pico/gps_raw', 10)
+        self.mag_pub = self.create_publisher(String, '/pico/mag_raw', 50)
 
         self.get_logger().info(f'Opening {port} @ {baud} baud')
         self.ser = serial.Serial(port, baud, timeout=0.1)
@@ -42,6 +43,8 @@ class SerialParserNode(Node):
                     self.imu_pub.publish(msg)
                 elif line.startswith('GPS:'):
                     self.gps_pub.publish(msg)
+                elif line.startswith('MAG:'):
+                    self.mag_pub.publish(msg)
         except serial.SerialException as e:
             self.get_logger().error(f'Serial error: {e}')
 

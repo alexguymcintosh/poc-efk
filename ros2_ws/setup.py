@@ -24,6 +24,7 @@ setup(
             'imu_node = pico_bridge.imu_node:main',
             'gps_node = pico_bridge.gps_node:main',
             'gps_to_odom_node = pico_bridge.gps_to_odom_node:main',
+            'mag_node = pico_bridge.mag_node:main',
         ],
     },
 )

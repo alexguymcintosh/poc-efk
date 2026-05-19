@@ -26,7 +26,9 @@ ekf_filter_node:
     base_link_frame: base_link
     world_frame: odom
 
-    # ---- IMU (MPU-6050: angular velocity + linear acceleration only) ----
+    # ---- IMU0: MPU-6050 — angular velocity only ----
+    # ax/ay/az disabled until mag heading is confirmed stable. Re-enable by
+    # setting the last three values to true once walk-test path tracks GPS.
     imu0: /imu/data_raw
     # config order: x, y, z, roll, pitch, yaw,
     #               vx, vy, vz, vroll, vpitch, vyaw,
@@ -35,11 +37,23 @@ ekf_filter_node:
                   false, false, false,
                   false, false, false,
                   true,  true,  true,
-                  true,  true,  true]
+                  false, false, false]
     imu0_differential: false
     imu0_relative: false
     imu0_queue_size: 10
     imu0_remove_gravitational_acceleration: true
+
+    # ---- IMU1: magnetometer — yaw (absolute heading) only ----
+    imu1: /imu/data
+    imu1_config: [false, false, false,
+                  false, false, true,
+                  false, false, false,
+                  false, false, false,
+                  false, false, false]
+    imu1_differential: false
+    imu1_relative: false
+    imu1_queue_size: 10
+    imu1_remove_gravitational_acceleration: false
 
     # ---- GPS odometry (from navsat_transform_node) ----
     odom0: /odometry/gps
